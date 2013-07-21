@@ -1,0 +1,15 @@
+{
+	"name": "Mongodb",
+	"description": "MongoDB database driver for CakePHP",
+
+	"author": "Yasushi Ichikawa",
+	"authorEmail": "",
+	"authorUrl": "",
+
+	"dependencies": {
+		"plugins": [
+			"acl",
+			"extensions"
+		]
+	}
+}
