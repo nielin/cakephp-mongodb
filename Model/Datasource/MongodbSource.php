@@ -144,6 +144,11 @@ class MongodbSource extends DboSource {
  * @access public
  */
 	function __construct($config = array(), $autoConnect = false) {
+		if(Configure::check('Mongodb.mode')) {
+			if(Configure::read('Mongodb.mode') == 'development') {
+				$config['database'] = $config['database'] . "_d";
+			}
+		}
 		return parent::__construct($config, $autoConnect);
 	}
 
