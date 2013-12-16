@@ -229,7 +229,7 @@ class MongodbSource extends DboSource {
 		public function createConnectionName($config, $version) {
 			$host = null;
 
-			if ($version >= '1.0.2') {
+			if (floatval($version) >= floatval('1.0.2')) {
 				$host = "mongodb://";
 			} else {
 				$host = '';
