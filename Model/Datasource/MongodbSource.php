@@ -387,7 +387,7 @@ class MongodbSource extends DboSource {
 		if (!$this->isConnected()) {
 			return false;
 		}
-		return true;
+		return true; // return $this->_db->getCollectionNames();
 	}
 
 /**
@@ -1130,9 +1130,421 @@ class MongodbSource extends DboSource {
 				}
 				$_return[][$Model->alias] = $mongodata;
 			}
-			return $_return;
+			$return = $_return;
 		}
+
+		/**
+         * Association retrieval (taken from @dizyart/master branch)
+         * 
+         */
+		if ($recursive === null && isset($queryData['recursive'])) {
+			$recursive = $queryData['recursive'];
+		}
+
+		if(!is_null($recursive)) {
+			if(is_array($recursive) && count($recursive) === 0) {
+				$recursive = 0;
+			}
+			$_recursive = $Model->recursive;
+			$Model->recursive = $recursive;
+		}
+
+		$_associations = $Model->getAssociated();
+
+		if($Model->recursive == -1) {
+			$_associations = array();
+		} 
+		else if($Model->recursive == 0) {
+			unset($_associations[2], $_associations[3]);
+		}
+
+		if ($Model->recursive > -1) {
+			$linkedModels = array();
+			foreach ($_associations as $type) {
+				foreach ($Model->{$type} as $association => $assocData) {
+					$linkModel = $Model->{$association};
+					$external = ($linkModel->useDbConfig !== $Model->useDbConfig);
+
+					# Get id list for conditions
+					$idList = array();
+					$keyName = $Model->primaryKey;
+					if($type === 'belongsTo') {
+						$keyName = $assocData['foreignKey'];
+					}
+					foreach($return as $modelData) {
+						if(!empty($modelData[$Model->alias]) && !empty($modelData[$Model->alias][$keyName])) {
+							$idList[] = $modelData[$Model->alias][$keyName];
+						}
+					}
+
+					if(!isset($linkedModels[$type . '/' . $association])) {
+						if($Model->useDbConfig === $linkModel->useDbConfig) {
+							$db = $this;
+						} 
+						else {
+							$db = ConnectionManager::getDataSource($linkModel->useDbConfig);
+						}
+					} 
+					else if($Model->recursive > 1 && ($type === 'belongsTo' || $type === 'hasOne')) {
+						$db = $this;
+					}
+
+					if (isset($db) && method_exists($db, 'queryAssociation')) {
+						$stack = array($association);
+						/** @todo $stack['_joined'] = $joined; **/
+
+						$db->queryAssociation($Model, $linkModel, $type, $association, $assocData, $queryData, $external, $return, $Model->recursive-1, $stack);
+						unset($db);
+					}
+				}
+			}
+		}
+
+		if(!is_null($recursive)) {
+			$Model->recursive = $_recursive;
+		}
+
 		return $return;
+	}
+
+/**
+ * Queries associations. Used to fetch results on recursive models.
+ *
+ * @param Model $model Primary Model object
+ * @param Model $linkModel Linked model that
+ * @param string $type Association type, one of the model association types ie. hasMany
+ * @param string $association
+ * @param array $assocData
+ * @param array $queryData
+ * @param boolean $external Whether or not the association query is on an external datasource.
+ * @param array $resultSet Existing results
+ * @param integer $recursive Number of levels of association
+ * @param array $stack
+ * @return mixed
+ * @throws CakeException when results cannot be created.
+ */
+	public function queryAssociation(Model $Model, &$linkModel, $type, $association, $assocData, &$queryData, $external, &$resultSet, $recursive, $stack) {
+            $idList = array();
+            $keyName = ($type === 'belongsTo') ? $assocData['foreignKey'] : $Model->primaryKey;
+            foreach($resultSet as $modelData) {
+                if(!empty($modelData[$Model->alias]) && isset($modelData[$Model->alias][$keyName])) {
+                    $idList[] = $modelData[$Model->alias][$keyName];
+                }
+            }
+            
+            if (count($idList) == 0) {
+                /**
+                 * @todo Check if other conditions might still invoke a query for associations
+                 */
+                return false;
+            }
+            
+        switch($type):
+            case 'hasMany':
+                $_conditions = array($assocData['foreignKey'] => array('$in' => $idList));
+                if(is_array($assocData['conditions'])) {
+                    $_conditions = array_merge($_conditions, $assocData['conditions']);
+                }
+                $params = array(
+                        'conditions' => $_conditions,
+                        'recursive' => $recursive - 1,
+                        );
+                $hasManyResult = $linkModel->find('all', $params);
+                
+
+                if(!empty($hasManyResult)) {
+                    //aggregate retrieving data using array key(foreigin key _id)
+                    $hasManyResultSet = array();
+                    foreach($hasManyResult as $key => $val) {
+                        $foreignKey = $val[$linkModel->alias][$assocData['foreignKey']];
+                        if(!empty($foreignKey)) {
+                            $hasManyResultSet[$foreignKey] = $val[$linkModel->alias];
+                        }
+                    }
+
+                    $this->_mergeHasMany($resultSet, $hasManyResult, $association, $Model, $linkModel);
+                }
+                break;
+
+            case 'hasOne':
+                $_conditions = array($assocData['foreignKey'] => array('$in' => $idList));
+                if(is_array($assocData['conditions'])) {
+                    $_conditions = array_merge($_conditions, $assocData['conditions']);
+                }
+                $params = array(
+                    'conditions' => $_conditions,
+                    'recursive' => $recursive - 1,
+                );
+                $hasOneResult = $linkModel->find('all', $params);
+
+                if(!empty($hasOneResult)) {
+                    //aggregate retrieving data using array key(foreigin key _id)
+                    $hasOneResultSet = array();
+                    foreach($hasOneResult as $key => $val) {
+                        $foreignKey = $val[$linkModel->alias][$assocData['foreignKey']];
+                        if(!empty($foreignKey)) {
+                            $hasOneResultSet[$foreignKey] = $val[$linkModel->alias];
+                        }
+                    }
+                    //set relational retrieving data to return data
+                    foreach($resultSet as $key => $val) {
+                        if(!empty($hasOneResultSet[ $val[$Model->alias][$Model->primaryKey] ])) {
+                            $resultSet[$key][$Model->alias][$linkModel->alias] = $hasOneResultSet[ $val[$Model->alias][$Model->primaryKey] ];
+                        } 
+                        else {
+                            $resultSet[$key][$Model->alias][$linkModel->alias] = array();
+                        }
+                    }
+                }
+                break;
+
+            case 'belongsTo':
+                $_conditions = array($linkModel->primaryKey => array('$in' => $idList));
+                if(is_array($assocData['conditions'])) {
+                    $_conditions = array_merge($_conditions, $assocData['conditions']);
+                }
+                $params = array(
+					'conditions' => $_conditions,
+					'recursive' => $recursive - 1,
+				);
+                $belongsToResult = $linkModel->find('all', $params);
+
+                if(!empty($belongsToResult)) {
+                    //aggregate retrieving data using array key(foreigin key _id)
+                    $belongsToResultSet = array();
+                    foreach($belongsToResult as $key => $val) {
+                        $belongsToResultSet[ $val[$linkModel->alias][$linkModel->primaryKey] ] = $val[$linkModel->alias];
+                    }
+                    //set relational retrieving data to return data
+                    foreach($resultSet as $key => $val) {
+                        if(!empty($belongsToResultSet[ $val[$Model->alias][$assocData['foreignKey']] ])) {
+                            $resultSet[$key][$linkModel->alias] = $belongsToResultSet[ $val[$Model->alias][$assocData['foreignKey']] ];
+                        }
+                        else {
+                            $resultSet[$key][$linkModel->alias] = array();
+                        }
+                    }
+                }
+                break;
+            
+            case 'hasAndBelongsToMany':
+                $_conditions = array($assocData['foreignKey'] => array('$in' => $idList));
+                if(is_array($assocData['conditions'])) {
+                    $_conditions = array_merge($_conditions, $assocData['conditions']);
+                }
+                
+                $params = array(
+                        'conditions' => $_conditions,
+                        'recursive' => $recursive - 1,
+                        );
+                
+                if (isset($assocData['with']) && !empty($assocData['with'])) { 
+                    /** 
+                     * @todo replace 'with' with $Model->joinModel($this->hasAndBelongsToMany[$assoc]['with']); 
+                     * @todo cleanup unecessary field checks (for schemaless models)
+                     */
+					$joinKeys = array($assocData['foreignKey'], $assocData['associationForeignKey']);
+					list($with, $joinFields) = $Model->joinModel($assocData['with'], $joinKeys);
+                    if (array_intersect($joinFields, $joinKeys) !== $joinKeys) {
+                        //ADD the join keys for schemaless join models
+                        /** @todo Account for schemaless join more conistently, this is basically guesswork */
+                        $joinFields = array_merge($joinFields, $joinKeys);
+                    }
+
+					$joinTbl = $Model->{$with};
+					$joinAlias = $joinTbl;
+
+					if (is_array($joinFields) && !empty($joinFields)) {
+						$joinAssoc = $joinAlias = $Model->{$with}->alias;
+						$joinFields = $this->fields($Model->{$with}, $joinAlias, $joinFields);
+					} else {
+						$joinFields = array();
+					}
+				} else {
+					$joinTbl = $assocData['joinTable'];
+					$joinAlias = $this->fullTableName($assocData['joinTable']);
+				}
+                
+                
+                $params['fields'] = (!empty($assocData['fields'])) ? array_merge($this->fields($linkModel, $association, $assocData['fields']), $joinFields) : '';
+                $params['limit'] = $assocData['limit'];
+                $params['order'] = $assocData['order'];
+                /** $query = array(
+					'conditions' => $assocData['conditions'],
+					'limit' => $assocData['limit'],
+					'table' => $this->fullTableName($linkModel),
+					'alias' => $association,
+					'fields' => array_merge($this->fields($linkModel, $association, $assocData['fields']), $joinFields),
+					'order' => $assocData['order'],
+					'group' => null,
+					'joins' => array(array(
+						'table' => $joinTbl,
+						'alias' => $joinAssoc,
+						'conditions' => $this->getConstraint('hasAndBelongsToMany', $model, $linkModel, $joinAlias, $assocData, $association)
+					))
+				); */
+                
+                
+                
+                $linkResults = $joinTbl->find('all', $params);
+                if (class_exists('Hash')){
+                    $associationIds = Hash::extract($linkResults, "{n}.$joinAlias.{$assocData['associationForeignKey']}");
+                } else {
+                    $associationIds = Set::extract($linkResults, "{n}.$joinAlias.{$assocData['associationForeignKey']}");
+                }
+                if (empty($associationIds)) {
+                    /**
+                     * @todo Should an Exception or warning be thrown if no associations are found?
+                     */
+                    return false;
+                }
+                $_conditions = array($linkModel->primaryKey => array('$in' => $associationIds));
+                if(is_array($assocData['conditions'])) {
+                    $_conditions = array_merge($_conditions, $assocData['conditions']);
+                }
+                $params['conditions'] = $_conditions;
+                
+                $habtmResults = $linkModel->find('all', $params);
+                
+                if (!empty($habtmResults)){
+                    foreach($resultSet as $index => $record) {
+                        /** @todo mangle data here if necessary */
+                    }
+                    $this->_mergeHabtm($resultSet, $linkResults, $habtmResults, $association, $model, $linkModel);
+                }
+                
+
+                //// TAKEN FROM DBO SOURCE
+                $joinFields = array();
+				$joinAssoc = null;
+
+				if (isset($assocData['with']) && !empty($assocData['with'])) {
+					$joinKeys = array($assocData['foreignKey'], $assocData['associationForeignKey']);
+					list($with, $joinFields) = $Model->joinModel($assocData['with'], $joinKeys);
+
+					$joinTbl = $Model->{$with};
+					$joinAlias = $joinTbl;
+
+					if (is_array($joinFields) && !empty($joinFields)) {
+						$joinAssoc = $joinAlias = $Model->{$with}->alias;
+						$joinFields = $this->fields($Model->{$with}, $joinAlias, $joinFields);
+					} else {
+						$joinFields = array();
+					}
+				} else {
+					$joinTbl = $assocData['joinTable'];
+					$joinAlias = $this->fullTableName($assocData['joinTable']);
+				}
+				$query = array(
+					'conditions' => $assocData['conditions'],
+					'limit' => $assocData['limit'],
+					'table' => $this->fullTableName($linkModel),
+					'alias' => $association,
+					'fields' => array_merge($this->fields($linkModel, $association, $assocData['fields']), $joinFields),
+					'order' => $assocData['order'],
+					'group' => null,
+					'joins' => array(array(
+						'table' => $joinTbl,
+						'alias' => $joinAssoc,
+						'conditions' => $this->getConstraint('hasAndBelongsToMany', $model, $linkModel, $joinAlias, $assocData, $association)
+					))
+				);
+                
+                
+                //// END TAKEN FROM DBO
+                
+                break;
+        endswitch; //$type
+    }
+    
+/**
+ * mergeHabtm - Merge the results of habtm relations.
+ *
+ *
+ * @param array $resultSet Data to merge into
+ * @param array $joinResults The data from the join table
+ * @param array $merge Data to merge
+ * @param string $association Name of Model being Merged
+ * @param Model $model Model being merged onto
+ * @param Model $linkModel Model being merged $Model->habtm[$association] => foreignKey, associationFK
+ * @return void
+ * $resultSet, $linkResults, $habtmResults, $association, $model, $linkModel
+ * 
+ * $model	Vehicle		
+	hasAndBelongsToMany	array[1]		
+		[Owner]	array[15]		
+			[className]	string	"Owner"	
+			[joinTable]	string	"owners_vehicles"	
+			[with]	string	"OwnersVehicle"	
+			[foreignKey]	string	"vehicle_id"	
+			[associationForeignKey]	string	"owner_id"	
+
+$linkResults	array[2]		
+	[0]	array[1]		
+		[OwnersVehicle]	array[3]		
+			[owner_id]	string	"513a943db58a90840400009c"	
+			[vehicle_id]	string	"513a943db58a90840400009b"	
+			[id]	string	"513a943db58a90840400009d"	
+				
+				
+				
+$resultSet	array[1]		
+	[0]	array[1]		
+		[Vehicle]	array[4]		
+			[name]	string	"Corvette V12"	
+			[id]	string	"513a943db58a90840400009b"	
+	
+	
+	
+$merge	array[2]		
+	[0]			
+		[Owner]		
+			[name]	string	"John Longbottom"	
+			[modified]	MongoDate		
+			[created]	MongoDate		
+			[id]	string	"513a943db58a90840400009c"	
+ * 
+ */
+	protected function _mergeHabtm(&$resultSet, $joinResults, $merge, $association, $Model, $linkModel) {
+        $associationData = $Model->hasAndBelongsToMany[$association];
+        $joinPK = $Model->hasAndBelongsToMany[$association]['foreignKey'];
+        $joinFK = $Model->hasAndBelongsToMany[$association]['associationForeignKey'];
+		$modelAlias = $Model->alias;
+		$modelPK = $Model->primaryKey;
+		
+		foreach ($resultSet as &$result) {
+			if (!isset($result[$modelAlias])) {
+				continue;
+			}
+			$merged = array();
+			foreach ($joinResults as $joinData) {
+                
+                if ($joinData[$associationData['with']][$joinPK] == $result[$modelAlias][$modelPK]){
+                    $mergeId = $joinData[$associationData['with']][$joinFK];
+                    foreach($merge as $mergeData){
+                        if ($mergeId == $mergeData[$association][$linkModel->primaryKey]){
+                            $result[$association][] = $mergeData[$association];
+                        }
+                    }
+                }
+				if ( false && $result[$modelAlias][$modelPK] === $data[$association][$modelFK]) {
+					if (count($data) > 1) {
+						$data = array_merge($data[$association], $data);
+						unset($data[$association]);
+						foreach ($data as $key => $name) {
+							if (is_numeric($key)) {
+								$data[$association][] = $name;
+								unset($data[$key]);
+							}
+						}
+						$merged[] = $data;
+					} else {
+						$merged[] = $data[$association];
+					}
+				}
+			}
+			//$result = Hash::mergeDiff($result, array($association => $merged));
+		}
 	}
 
 /**
